@@ -1,0 +1,9 @@
+{
+  "label": "Concepts",
+  "position": 5,
+  "link": {
+    "type": "generated-index",
+    "title": "Concepts",
+    "description": "Consolidation logic and backward-compatible scraping."
+  }
+}

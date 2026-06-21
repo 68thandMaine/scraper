@@ -1,80 +1,112 @@
-# Web Scraper v2
+# Web Scraper Agent
 
-A comprehensive web scraping tool that extracts text content from websites and their internal links, outputting the content to organized text files.
+A Dockerized web scraper that crawls sites, cleans each page with a local
+**Ollama** model, and uses **ChromaDB** vector memory to detect duplicates and
+consolidate overlapping documentation.
+
+**Documentation:** run `make docs` or see the [docs site](docs/README.md).
 
 ## Features
 
-- 🌐 Scrape websites and follow internal links
-- 📝 Extract clean text content from HTML pages
-- 📁 Output up to 300 organized .txt files
-- 🖥️ Command-line interface (CLI) 
-- 📓 Jupyter notebook for interactive testing
-- 🧪 Comprehensive test suite
-- 🎨 Code formatting with Black and isort
-- 🔍 Linting with flake8 and type checking with mypy
+- Crawl websites and follow internal links (subdomain + path filters)
+- Agent pipeline: clean, embed, recall, decide, store
+- ChromaDB vector memory for similarity and consolidation
+- Fully Dockerized (Ollama + ChromaDB + scraper-agent)
+- Legacy `--no-agent` mode for direct HTML-to-text output
+- CLI, tests, and Docusaurus documentation
 
-## Installation
+## Quick start (Docker)
 
-1. Clone the repository
-2. Install dependencies:
+```bash
+# Start Ollama and ChromaDB (first run pulls qwen2.5:3b + nomic-embed-text)
+docker compose up -d ollama chromadb
+
+# Scrape with the agent
+docker compose --profile scrape run --rm scraper-agent scrape \
+  https://example.com/docs \
+  --output-dir /app/scraped_data \
+  --max-files 50
+```
+
+Output is written to `./scraped_data/` on the host.
+
+## Installation (local)
+
 ```bash
 pip install -r requirements.txt
+pip install -e .
+cp .env.example .env
 ```
 
 ## Usage
 
-### Command Line Interface
-
 ```bash
-# Basic scraping
+# Agent mode (default) -- requires Ollama + ChromaDB
 python -m web_scraper scrape https://example.com
 
-# Specify output directory and max files
-python -m web_scraper scrape https://example.com --output-dir ./scraped_docs/scraped_data --max-files 100
+# Legacy direct save (no LLM)
+python -m web_scraper scrape https://example.com --no-agent
 
-# Include external links (default: internal only)
-python -m web_scraper scrape https://example.com --include-external
-
-# Restrict to a path prefix (start URL path must begin with this prefix)
-python -m web_scraper scrape https://example.com/docs/guide --output-dir ./docs --path-prefix /docs
+# Options
+python -m web_scraper scrape https://example.com \
+  --output-dir ./scraped_data \
+  --max-files 100 \
+  --model qwen2.5:3b \
+  --similarity-threshold 0.85
 ```
 
-### Jupyter Notebook
+### Faster inference on Mac (recommended)
 
-Open `scraper_notebook.ipynb` to interactively test and experiment with the scraping functionality.
+Run Ollama natively (Metal/GPU), keep ChromaDB in Docker, and point the scraper at the host:
 
-## Development
-
-### Running Tests
 ```bash
-pytest tests/ -v --cov=web_scraper
+ollama pull qwen2.5:3b
+ollama pull nomic-embed-text
+docker compose up -d chromadb
+
+OLLAMA_HOST=http://host.docker.internal:11434 \
+docker compose --profile scrape run --rm scraper-agent scrape \
+  "https://code.claude.com/docs/en/memory" \
+  --output-dir /app/scraped_data \
+  --subdomain code.claude.com/docs/en -t 60 -m 5 -y
 ```
 
-### Code Formatting
-```bash
-black web_scraper/ tests/
-isort web_scraper/ tests/
-```
+## Makefile
 
-### Linting
-```bash
-flake8 web_scraper/ tests/
-mypy web_scraper/
-```
+| Command | Description |
+|---------|-------------|
+| `make install` | Install Python dependencies |
+| `make test` | Run pytest with coverage |
+| `make docker-up` | Start Ollama + ChromaDB |
+| `make docker-scrape URL=...` | Run scrape in Docker |
+| `make docs` | Start Docusaurus locally |
 
-## Project Structure
+## Project structure
 
 ```
 scraper-main/
-├── web_scraper/           # Main package
-│   ├── __init__.py
-│   ├── scraper.py        # Core scraping logic
-│   ├── cli.py            # Command-line interface
-│   └── utils.py          # Utility functions
-├── tests/                # Test suite
-├── scraped_docs/         # Scraped site output (default CLI target: scraped_docs/scraped_data)
-├── scraper_notebook.ipynb # Jupyter notebook
-├── requirements.txt      # Dependencies
-├── setup.cfg            # Configuration
-└── README.md            # Documentation
+├── web_scraper/
+│   ├── agent.py          # Ollama + ChromaDB agent pipeline
+│   ├── prompts.py        # LLM prompt templates
+│   ├── scraper.py        # Crawler
+│   └── cli.py            # CLI
+├── docker-compose.yml
+├── Dockerfile
+├── docs/                 # Docusaurus documentation site
+├── scraped_data/         # Default agent output (gitignored)
+└── tests/
 ```
+
+## Development
+
+```bash
+make test
+make lint
+make format
+```
+
+## Environment
+
+See [.env.example](.env.example) for `OLLAMA_HOST`, `OLLAMA_MODEL` (default
+`qwen2.5:3b`), `OLLAMA_EMBED_MODEL`, `MAX_LLM_INPUT_CHARS`, `CHROMA_HOST`, and
+`SIMILARITY_THRESHOLD`.
