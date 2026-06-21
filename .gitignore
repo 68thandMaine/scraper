@@ -124,6 +124,7 @@ dmypy.json
 
 # Scraped / output directories (add custom --output-dir names here)
 scraped_docs/
+scraped_data/
 demo_scraped_data/
 *_scraped_data/
 

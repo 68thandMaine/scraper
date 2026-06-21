@@ -1,0 +1,95 @@
+services:
+  ollama:
+    image: ollama/ollama:latest
+    container_name: scraper-ollama
+    volumes:
+      - ollama_data:/root/.ollama
+      - ./scripts/pull-model.sh:/scripts/pull-model.sh:ro
+    entrypoint: ["/bin/sh", "/scripts/pull-model.sh"]
+    ports:
+      - "11434:11434"
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 120s
+    networks:
+      - scraper-net
+
+  chromadb:
+    image: chromadb/chroma:latest
+    container_name: scraper-chromadb
+    environment:
+      IS_PERSISTENT: "TRUE"
+      ANONYMIZED_TELEMETRY: "FALSE"
+    volumes:
+      - chroma_data:/chroma/chroma
+    ports:
+      - "8000:8000"
+    healthcheck:
+      # Slim Chroma image has no curl; use bash TCP check (see chroma-cookbook)
+      test: ["CMD", "/bin/bash", "-c", "</dev/tcp/localhost/8000"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+    networks:
+      - scraper-net
+
+  scraper-agent:
+    build: .
+    container_name: scraper-agent
+    dns:
+      - 8.8.8.8
+      - 8.8.4.4
+    depends_on:
+      ollama:
+        condition: service_healthy
+      chromadb:
+        condition: service_healthy
+    environment:
+      # Use http://host.docker.internal:11434 for Ollama on the Mac host (Metal/GPU)
+      OLLAMA_HOST: ${OLLAMA_HOST:-http://ollama:11434}
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-qwen2.5:3b}
+      OLLAMA_EMBED_MODEL: ${OLLAMA_EMBED_MODEL:-nomic-embed-text}
+      CHROMA_HOST: chromadb
+      CHROMA_PORT: "8000"
+      SIMILARITY_THRESHOLD: ${SIMILARITY_THRESHOLD:-0.85}
+      OLLAMA_TIMEOUT: ${OLLAMA_TIMEOUT:-600}
+      MAX_LLM_INPUT_CHARS: ${MAX_LLM_INPUT_CHARS:-10000}
+      OLLAMA_NUM_PREDICT: ${OLLAMA_NUM_PREDICT:-2048}
+      WAIT_FOR_SERVICES: ${WAIT_FOR_SERVICES:-false}
+      SCRAPED_DATA_DIR: /app/scraped_data
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./scraped_data:/app/scraped_data
+    networks:
+      - scraper-net
+    profiles:
+      - scrape
+
+  docs:
+    image: node:20-alpine
+    container_name: scraper-docs
+    working_dir: /app/docs
+    volumes:
+      - ./docs:/app/docs
+      - docs_node_modules:/app/docs/node_modules
+    ports:
+      - "3000:3000"
+    command: sh -c "npm install && npm run start -- --host 0.0.0.0"
+    networks:
+      - scraper-net
+    profiles:
+      - docs
+
+volumes:
+  ollama_data:
+  chroma_data:
+  docs_node_modules:
+
+networks:
+  scraper-net:
+    driver: bridge

@@ -1,15 +1,18 @@
-.PHONY: help install test lint format clean dev-setup notebook
+.PHONY: help install test lint format clean dev-setup notebook docker-up docker-scrape docs
 
 help:
 	@echo "Available commands:"
-	@echo "  install    - Install the package and dependencies"
-	@echo "  dev-setup  - Set up development environment"
-	@echo "  test       - Run tests with coverage"
-	@echo "  lint       - Run linting checks"
-	@echo "  format     - Format code with black and isort"
-	@echo "  clean      - Clean up build artifacts"
-	@echo "  notebook   - Create Jupyter notebook from example"
-	@echo "  demo       - Run interactive demo"
+	@echo "  install        - Install the package and dependencies"
+	@echo "  dev-setup      - Set up development environment"
+	@echo "  test           - Run tests with coverage"
+	@echo "  lint           - Run linting checks"
+	@echo "  format         - Format code with black and isort"
+	@echo "  clean          - Clean up build artifacts"
+	@echo "  notebook       - Create Jupyter notebook from example"
+	@echo "  demo           - Run interactive demo"
+	@echo "  docker-up      - Start Ollama and ChromaDB services"
+	@echo "  docker-scrape  - Run scraper-agent (set URL=...)"
+	@echo "  docs           - Start Docusaurus docs locally"
 
 install:
 	pip install -r requirements.txt
@@ -65,3 +68,12 @@ test-utils:
 
 test-scraper:
 	pytest tests/test_scraper.py -v
+
+docker-up:
+	docker compose up -d ollama chromadb
+
+docker-scrape:
+	docker compose --profile scrape run --rm scraper-agent scrape $(URL) $(ARGS)
+
+docs:
+	cd docs && npm install && npm run start
