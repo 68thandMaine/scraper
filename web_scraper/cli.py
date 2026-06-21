@@ -1,6 +1,7 @@
 """Command-line interface for the web scraper."""
 
 import logging
+import os
 from pathlib import Path
 from typing import Optional
 
@@ -8,6 +9,9 @@ import click
 from validators import url as validate_url
 
 from . import __version__
+from .agent import ContentAgent, OllamaClient
+from .constants import DEFAULT_OLLAMA_EMBED_MODEL, DEFAULT_OLLAMA_MODEL
+from .logging_config import configure_logging
 from .scraper import WebScraper
 from .utils import extract_links_from_html
 
@@ -19,10 +23,7 @@ from .utils import extract_links_from_html
 )
 def cli(verbose: bool) -> None:
     """Web Scraper v2 - Extract text content from websites."""
-    if verbose:
-        logging.basicConfig(level=logging.DEBUG)
-    else:
-        logging.basicConfig(level=logging.INFO)
+    configure_logging(verbose=verbose)
 
 
 @cli.command()
@@ -89,6 +90,27 @@ def cli(verbose: bool) -> None:
     is_flag=True,
     help="Fetch each page with a headless browser (for JS-rendered content like cursor.com/docs).",
 )
+@click.option(
+    "--agent/--no-agent",
+    default=True,
+    help="Process pages with the Ollama agent (default: enabled).",
+)
+@click.option(
+    "--model",
+    default=None,
+    help=f"Ollama model for generation (default: OLLAMA_MODEL env or {DEFAULT_OLLAMA_MODEL}).",
+)
+@click.option(
+    "--embed-model",
+    default=None,
+    help=f"Ollama model for embeddings (default: OLLAMA_EMBED_MODEL or {DEFAULT_OLLAMA_EMBED_MODEL}).",
+)
+@click.option(
+    "--similarity-threshold",
+    default=None,
+    type=float,
+    help="Cosine similarity threshold for consolidation (default: 0.85).",
+)
 def scrape(
     url: str,
     output_dir: str,
@@ -101,6 +123,10 @@ def scrape(
     force: bool,
     user_agent: str,
     use_browser: bool,
+    agent: bool,
+    model: Optional[str],
+    embed_model: Optional[str],
+    similarity_threshold: Optional[float],
 ) -> None:
     """
     Scrape a website and extract text content.
@@ -129,6 +155,46 @@ def scrape(
         use_browser=use_browser,
     )
 
+    content_agent: Optional[ContentAgent] = None
+    if agent:
+        try:
+            logging.getLogger(__name__).info(
+                "Initializing agent (ChromaDB connects on first document)"
+            )
+            ollama = OllamaClient(
+                host=os.getenv("OLLAMA_HOST"),
+                model=model,
+                embed_model=embed_model,
+            )
+            ollama.ensure_models()
+            content_agent = ContentAgent(
+                output_dir=output_dir,
+                ollama=ollama,
+                memory=None,
+                similarity_threshold=similarity_threshold,
+            )
+        except ImportError as exc:
+            click.echo(
+                "Error: agent mode requires chromadb and httpx. "
+                "Run: pip install -r requirements.txt",
+                err=True,
+            )
+            raise click.Abort() from exc
+        except ValueError as exc:
+            click.echo(
+                f"Error: {exc}\n"
+                "Start ChromaDB (e.g. docker compose up -d chromadb) or use --no-agent.",
+                err=True,
+            )
+            raise click.Abort() from exc
+        except Exception as exc:
+            click.echo(
+                f"Error: cannot initialize agent ({exc}).\n"
+                "Ensure Ollama and ChromaDB are running, or use --no-agent.",
+                err=True,
+            )
+            raise click.Abort() from exc
+
     try:
         # Start scraping
         click.echo(f"Starting to scrape: {url}")
@@ -140,6 +206,19 @@ def scrape(
         )
         click.echo(f"Path prefix: {path_prefix if path_prefix else '(none)'}")
         click.echo(f"Use browser: {'Yes' if use_browser else 'No'}")
+        click.echo(f"Agent mode: {'Yes' if agent else 'No (legacy direct save)'}")
+        if agent:
+            click.echo(
+                f"Ollama model: {model or os.getenv('OLLAMA_MODEL', DEFAULT_OLLAMA_MODEL)}"
+            )
+            click.echo(
+                "Embed model: "
+                f"{embed_model or os.getenv('OLLAMA_EMBED_MODEL', DEFAULT_OLLAMA_EMBED_MODEL)}"
+            )
+            threshold = similarity_threshold or float(
+                os.getenv("SIMILARITY_THRESHOLD", "0.85")
+            )
+            click.echo(f"Similarity threshold: {threshold}")
         click.echo("-" * 50)
 
         results = scraper.scrape_website(
@@ -148,6 +227,7 @@ def scrape(
             include_external=include_external,
             allowed_subdomain=subdomain,
             path_prefix=path_prefix,
+            agent=content_agent,
         )
 
         # Display results
@@ -155,9 +235,18 @@ def scrape(
         click.echo("SCRAPING COMPLETED")
         click.echo("=" * 50)
         click.echo(f"Files created: {results['files_created']}")
+        click.echo(f"Pages processed: {results.get('pages_processed', results['files_created'])}")
         click.echo(f"URLs scraped: {results['urls_scraped']}")
         click.echo(f"URLs failed: {results['urls_failed']}")
         click.echo(f"Output directory: {results['output_directory']}")
+
+        if "agent_stats" in results:
+            agent_stats = results["agent_stats"]
+            click.echo("\nAgent decisions:")
+            click.echo(f"  Saved: {agent_stats['saved']}")
+            click.echo(f"  Consolidated: {agent_stats['consolidated']}")
+            click.echo(f"  Skipped: {agent_stats['skipped']}")
+            click.echo(f"  Errors: {agent_stats['errors']}")
 
         # Display statistics
         stats = scraper.get_stats()
