@@ -14,6 +14,7 @@ import requests
 from bs4 import BeautifulSoup
 from tqdm import tqdm
 
+from .logging_config import Spinner
 from .utils import (
     clean_filename,
     create_output_directory,
@@ -286,64 +287,70 @@ class WebScraper:
         errors = 0
 
         pbar = tqdm(total=self.max_files, unit="page", dynamic_ncols=True)
+        spinner = Spinner(pbar)
         try:
-            for scraped_data in self.iter_scraped_pages(
-                start_url=start_url,
-                include_external=include_external,
-                allowed_subdomain=allowed_subdomain,
-                path_prefix=path_prefix,
-            ):
-                pages_processed += 1
-                if agent is not None:
-                    self.logger.info(
-                        "Handing off to agent (%d/%d): %s",
-                        pages_processed,
-                        self.max_files,
-                        scraped_data["url"],
-                    )
-                    result = agent.process_document(scraped_data)
-                    self.logger.info(
-                        "Agent result for %s: %s (%s)",
-                        scraped_data["url"],
-                        result.decision.value,
-                        result.reason,
-                    )
-                    decision = result.decision.value
-                    if decision == "SAVE":
-                        saved += 1
-                        files_created += 1
-                    elif decision == "CONSOLIDATE":
-                        consolidated += 1
-                        files_created += 1
-                    elif decision == "SKIP":
-                        skipped += 1
-                    else:
-                        errors += 1
-                    pbar.set_postfix(
-                        saved=saved,
-                        consolidated=consolidated,
-                        skipped=skipped,
-                        errors=errors,
-                    )
-                else:
-                    filename = self._create_filename(
-                        scraped_data["title"], files_created
-                    )
-                    file_path = output_path / f"{filename}.txt"
-                    try:
-                        with open(file_path, "w", encoding="utf-8") as handle:
-                            handle.write(f"URL: {scraped_data['url']}\n")
-                            handle.write(f"Title: {scraped_data['title']}\n")
-                            handle.write("-" * 50 + "\n\n")
-                            handle.write(scraped_data["content"])
-                        files_created += 1
-                        self.logger.info(f"Saved: {filename}.txt")
-                    except OSError as exc:
-                        self.logger.error(
-                            f"Failed to save file {filename}.txt: {exc}"
+            with spinner:
+                for scraped_data in self.iter_scraped_pages(
+                    start_url=start_url,
+                    include_external=include_external,
+                    allowed_subdomain=allowed_subdomain,
+                    path_prefix=path_prefix,
+                ):
+                    pages_processed += 1
+                    spinner.update_message(f"{pages_processed}/{self.max_files}")
+                    if agent is not None:
+                        self.logger.info(
+                            "Handing off to agent (%d/%d): %s",
+                            pages_processed,
+                            self.max_files,
+                            scraped_data["url"],
                         )
-                    pbar.set_postfix(files=files_created)
-                pbar.update(1)
+                        result = agent.process_document(scraped_data)
+                        self.logger.info(
+                            "Agent result for %s: %s (%s)",
+                            scraped_data["url"],
+                            result.decision.value,
+                            result.reason,
+                        )
+                        decision = result.decision.value
+                        if decision == "SAVE":
+                            saved += 1
+                            files_created += 1
+                        elif decision == "CONSOLIDATE":
+                            consolidated += 1
+                            files_created += 1
+                        elif decision == "SKIP":
+                            skipped += 1
+                        else:
+                            errors += 1
+                        with spinner.lock:
+                            pbar.set_postfix(
+                                saved=saved,
+                                consolidated=consolidated,
+                                skipped=skipped,
+                                errors=errors,
+                            )
+                            pbar.update(1)
+                    else:
+                        filename = self._create_filename(
+                            scraped_data["title"], files_created
+                        )
+                        file_path = output_path / f"{filename}.txt"
+                        try:
+                            with open(file_path, "w", encoding="utf-8") as handle:
+                                handle.write(f"URL: {scraped_data['url']}\n")
+                                handle.write(f"Title: {scraped_data['title']}\n")
+                                handle.write("-" * 50 + "\n\n")
+                                handle.write(scraped_data["content"])
+                            files_created += 1
+                            self.logger.info(f"Saved: {filename}.txt")
+                        except OSError as exc:
+                            self.logger.error(
+                                f"Failed to save file {filename}.txt: {exc}"
+                            )
+                        with spinner.lock:
+                            pbar.set_postfix(files=files_created)
+                            pbar.update(1)
         finally:
             pbar.close()
 
