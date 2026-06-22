@@ -6,12 +6,13 @@ import logging
 import math
 import os
 import re
+import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple, TypeVar, cast
 
 import httpx
 
@@ -25,17 +26,25 @@ from .prompts import (
     SIMILAR_SECTION_TEMPLATE,
 )
 from .constants import (
+    DEFAULT_CHROMA_MAX_RETRIES,
+    DEFAULT_CHROMA_RETRY_BACKOFF,
+    DEFAULT_CHROMA_TIMEOUT,
     DEFAULT_MAX_EMBED_INPUT_CHARS,
     DEFAULT_MAX_LLM_INPUT_CHARS,
+    DEFAULT_OLLAMA_CONNECT_TIMEOUT,
     DEFAULT_OLLAMA_EMBED_MODEL,
+    DEFAULT_OLLAMA_MAX_RETRIES,
     DEFAULT_OLLAMA_MODEL,
     DEFAULT_OLLAMA_NUM_PREDICT,
+    DEFAULT_OLLAMA_RETRY_BACKOFF,
     DEFAULT_OLLAMA_TIMEOUT,
 )
 from .logging_config import log_step
 from .utils import clean_filename, create_output_directory
 
 logger = logging.getLogger(__name__)
+
+_T = TypeVar("_T")
 
 
 def _truncate_for_llm(text: str, label: str) -> str:
@@ -112,7 +121,22 @@ class OllamaClient:
         self.max_embed_input_chars = int(
             os.getenv("MAX_EMBED_INPUT_CHARS", str(DEFAULT_MAX_EMBED_INPUT_CHARS))
         )
-        self._client = httpx.Client(base_url=self.host, timeout=self.timeout)
+        self.max_retries = int(
+            os.getenv("OLLAMA_MAX_RETRIES", str(DEFAULT_OLLAMA_MAX_RETRIES))
+        )
+        self.retry_backoff = float(
+            os.getenv("OLLAMA_RETRY_BACKOFF", str(DEFAULT_OLLAMA_RETRY_BACKOFF))
+        )
+        self._client = httpx.Client(
+            base_url=self.host,
+            timeout=httpx.Timeout(
+                connect=DEFAULT_OLLAMA_CONNECT_TIMEOUT,
+                read=self.timeout,
+                write=30.0,
+                pool=DEFAULT_OLLAMA_CONNECT_TIMEOUT,
+            ),
+            limits=httpx.Limits(max_keepalive_connections=0, max_connections=10),
+        )
 
     def list_models(self) -> List[str]:
         """Return model names reported by Ollama."""
@@ -164,6 +188,29 @@ class OllamaClient:
                 f"Pull them on the host serving {self.host}:\n{pull_lines}"
             )
 
+    def _post_with_retry(
+        self, path: str, payload: dict, operation: str
+    ) -> httpx.Response:
+        last_exc: Exception = RuntimeError("unreachable")
+        total = self.max_retries + 1
+        for attempt in range(1, total + 1):
+            try:
+                return self._client.post(path, json=payload)
+            except (httpx.TimeoutException, httpx.TransportError) as exc:
+                last_exc = exc
+                if attempt < total:
+                    delay = self.retry_backoff * attempt
+                    logger.warning(
+                        "Ollama %s POST failed (attempt %d/%d): %r; retrying in %.1fs",
+                        operation,
+                        attempt,
+                        total,
+                        exc,
+                        delay,
+                    )
+                    time.sleep(delay)
+        raise last_exc
+
     def _raise_for_status(self, response: httpx.Response, operation: str) -> None:
         if response.is_success:
             return
@@ -190,15 +237,16 @@ class OllamaClient:
         )
         started = time.perf_counter()
         num_predict = int(os.getenv("OLLAMA_NUM_PREDICT", str(DEFAULT_OLLAMA_NUM_PREDICT)))
-        response = self._client.post(
+        response = self._post_with_retry(
             "/api/generate",
-            json={
+            {
                 "model": self.model,
                 "system": system,
                 "prompt": prompt,
                 "stream": False,
                 "options": {"num_predict": num_predict},
             },
+            "generate",
         )
         self._raise_for_status(response, "generate")
         data = response.json()
@@ -270,12 +318,13 @@ class OllamaClient:
         else:
             input_payload = chunks[0]
 
-        response = self._client.post(
+        response = self._post_with_retry(
             "/api/embed",
-            json={
+            {
                 "model": self.embed_model,
                 "input": input_payload,
             },
+            "embed",
         )
         if not response.is_success:
             detail = response.text
@@ -335,11 +384,19 @@ class DocumentMemory:
         self._collection_name = collection_name
         self._client: Any = None
         self._collection: Any = None
+        self._timeout = float(os.getenv("CHROMA_TIMEOUT", str(DEFAULT_CHROMA_TIMEOUT)))
+        self._max_retries = int(
+            os.getenv("CHROMA_MAX_RETRIES", str(DEFAULT_CHROMA_MAX_RETRIES))
+        )
+        self._retry_backoff = float(
+            os.getenv("CHROMA_RETRY_BACKOFF", str(DEFAULT_CHROMA_RETRY_BACKOFF))
+        )
 
     def _ensure_connected(self) -> None:
         if self._collection is not None:
             return
         import chromadb
+        from chromadb.config import Settings
 
         logger.info(
             "Connecting to ChromaDB at %s:%s collection=%s",
@@ -348,7 +405,14 @@ class DocumentMemory:
             self._collection_name,
         )
         started = time.perf_counter()
-        self._client = chromadb.HttpClient(host=self._host, port=self._port)
+        self._client = chromadb.HttpClient(
+            host=self._host,
+            port=self._port,
+            settings=Settings(
+                chroma_http_max_keepalive_connections=0,
+                chroma_http_max_connections=10,
+            ),
+        )
         self._collection = self._client.get_or_create_collection(
             name=self._collection_name,
             metadata={"hnsw:space": "cosine"},
@@ -359,42 +423,93 @@ class DocumentMemory:
             self._collection.count(),
         )
 
+    def _reset_connection(self) -> None:
+        self._client = None
+        self._collection = None
+
+    def _run_with_timeout(self, label: str, fn: Callable[[], _T]) -> _T:
+        total = self._max_retries + 1
+        last_error: Exception = RuntimeError("unreachable")
+
+        for attempt in range(1, total + 1):
+            _result: Dict[str, Any] = {}
+
+            def _target(r: Dict[str, Any] = _result) -> None:
+                try:
+                    r["value"] = fn()
+                except Exception as exc:
+                    r["error"] = exc
+
+            thread = threading.Thread(target=_target, daemon=True)
+            thread.start()
+            thread.join(self._timeout)
+
+            if thread.is_alive():
+                last_error = TimeoutError(
+                    f"ChromaDB {label} timed out after {self._timeout}s"
+                )
+                self._reset_connection()
+            elif "error" in _result:
+                exc = _result["error"]
+                if isinstance(exc, (httpx.TimeoutException, httpx.TransportError)):
+                    last_error = exc
+                    self._reset_connection()
+                else:
+                    raise exc
+            else:
+                return cast(_T, _result["value"])
+
+            if attempt < total:
+                delay = self._retry_backoff * attempt
+                logger.warning(
+                    "ChromaDB %s failed (attempt %d/%d): %r; retrying in %.1fs",
+                    label,
+                    attempt,
+                    total,
+                    last_error,
+                    delay,
+                )
+                time.sleep(delay)
+
+        raise last_error
+
     def query_similar(
         self,
         embedding: List[float],
         top_k: int = 5,
     ) -> List[SimilarDocument]:
         """Find similar documents by embedding."""
-        self._ensure_connected()
-        if self._collection.count() == 0:
-            return []
 
-        results = self._collection.query(
-            query_embeddings=[embedding],
-            n_results=min(top_k, self._collection.count()),
-            include=["documents", "metadatas", "distances"],
-        )
-
-        similar: List[SimilarDocument] = []
-        ids = results.get("ids", [[]])[0]
-        documents = results.get("documents", [[]])[0]
-        metadatas = results.get("metadatas", [[]])[0]
-        distances = results.get("distances", [[]])[0]
-
-        for doc_id, content, metadata, distance in zip(
-            ids, documents, metadatas, distances
-        ):
-            meta = metadata or {}
-            similar.append(
-                SimilarDocument(
-                    doc_id=doc_id,
-                    url=str(meta.get("url", "")),
-                    title=str(meta.get("title", "")),
-                    content=content or "",
-                    distance=float(distance),
-                )
+        def _op() -> List[SimilarDocument]:
+            self._ensure_connected()
+            if self._collection.count() == 0:
+                return []
+            results = self._collection.query(
+                query_embeddings=[embedding],
+                n_results=min(top_k, self._collection.count()),
+                include=["documents", "metadatas", "distances"],
             )
-        return similar
+            similar: List[SimilarDocument] = []
+            ids = results.get("ids", [[]])[0]
+            documents = results.get("documents", [[]])[0]
+            metadatas = results.get("metadatas", [[]])[0]
+            distances = results.get("distances", [[]])[0]
+            for doc_id, content, metadata, distance in zip(
+                ids, documents, metadatas, distances
+            ):
+                meta = metadata or {}
+                similar.append(
+                    SimilarDocument(
+                        doc_id=doc_id,
+                        url=str(meta.get("url", "")),
+                        title=str(meta.get("title", "")),
+                        content=content or "",
+                        distance=float(distance),
+                    )
+                )
+            return similar
+
+        return self._run_with_timeout("query", _op)
 
     def upsert(
         self,
@@ -404,39 +519,51 @@ class DocumentMemory:
         metadata: Dict[str, Any],
     ) -> None:
         """Add or update a document in the collection."""
-        self._ensure_connected()
-        self._collection.upsert(
-            ids=[doc_id],
-            documents=[content],
-            embeddings=[embedding],
-            metadatas=[metadata],
-        )
+
+        def _op() -> None:
+            self._ensure_connected()
+            self._collection.upsert(
+                ids=[doc_id],
+                documents=[content],
+                embeddings=[embedding],
+                metadatas=[metadata],
+            )
+
+        self._run_with_timeout("upsert", _op)
 
     def delete(self, doc_id: str) -> None:
         """Remove a document from the collection."""
-        self._ensure_connected()
-        self._collection.delete(ids=[doc_id])
+
+        def _op() -> None:
+            self._ensure_connected()
+            self._collection.delete(ids=[doc_id])
+
+        self._run_with_timeout("delete", _op)
 
     def get(self, doc_id: str) -> Optional[SimilarDocument]:
         """Fetch a document by id."""
-        self._ensure_connected()
-        results = self._collection.get(
-            ids=[doc_id],
-            include=["documents", "metadatas"],
-        )
-        ids = results.get("ids") or []
-        if not ids:
-            return None
-        documents = results.get("documents") or [""]
-        metadatas = results.get("metadatas") or [{}]
-        meta = metadatas[0] or {}
-        return SimilarDocument(
-            doc_id=ids[0],
-            url=str(meta.get("url", "")),
-            title=str(meta.get("title", "")),
-            content=documents[0] or "",
-            distance=0.0,
-        )
+
+        def _op() -> Optional[SimilarDocument]:
+            self._ensure_connected()
+            results = self._collection.get(
+                ids=[doc_id],
+                include=["documents", "metadatas"],
+            )
+            ids = results.get("ids") or []
+            if not ids:
+                return None
+            documents = results.get("documents") or [""]
+            metadatas = results.get("metadatas") or [{}]
+            meta = metadatas[0] or {}
+            return SimilarDocument(
+                doc_id=ids[0],
+                url=str(meta.get("url", "")),
+                title=str(meta.get("title", "")),
+                content=documents[0] or "",
+                distance=0.0,
+            )
+
+        return self._run_with_timeout("get", _op)
 
 
 class ContentAgent:

@@ -1,8 +1,11 @@
 """Tests for the Ollama content agent."""
 
+import logging
+import sys
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
+import httpx
 import pytest
 
 from web_scraper.agent import (
@@ -11,6 +14,39 @@ from web_scraper.agent import (
     DocumentMemory,
     OllamaClient,
 )
+from web_scraper.logging_config import Spinner, configure_logging
+
+
+class TestConfigureLogging:
+    def _reset_root(self) -> None:
+        root = logging.getLogger()
+        root.handlers.clear()
+        root.setLevel(logging.NOTSET)
+
+    def test_verbose_false_sets_warning(self) -> None:
+        self._reset_root()
+        configure_logging(verbose=False)
+        assert logging.getLogger().level == logging.WARNING
+        self._reset_root()
+
+    def test_verbose_true_sets_debug(self) -> None:
+        self._reset_root()
+        configure_logging(verbose=True)
+        assert logging.getLogger().level == logging.DEBUG
+        self._reset_root()
+
+
+class TestSpinner:
+    def test_start_no_op_when_not_tty(self) -> None:
+        mock_pbar = MagicMock()
+        spinner = Spinner(mock_pbar, interval=0.05)
+
+        with patch.object(sys.stderr, "isatty", return_value=False):
+            spinner.start()
+            spinner.stop()
+
+        assert spinner._thread is None
+        mock_pbar.set_description_str.assert_not_called()
 
 
 class TestOllamaClient:
@@ -71,6 +107,50 @@ class TestOllamaClient:
         call_kwargs = mock_client.post.call_args
         sent_input = call_kwargs[1]["json"]["input"]
         assert isinstance(sent_input, str)
+
+    @patch("web_scraper.agent.time.sleep")
+    @patch("web_scraper.agent.httpx.Client")
+    def test_generate_retries_on_timeout_then_succeeds(
+        self, mock_client_cls: MagicMock, mock_sleep: MagicMock
+    ) -> None:
+        mock_client = MagicMock()
+        mock_client_cls.return_value = mock_client
+        mock_response = MagicMock()
+        mock_response.is_success = True
+        mock_response.json.return_value = {"response": "result text"}
+        mock_client.post.side_effect = [
+            httpx.ReadTimeout("timed out"),
+            mock_response,
+        ]
+
+        client = OllamaClient(host="http://localhost:11434", model="qwen2.5:3b")
+        client.max_retries = 1
+        client.retry_backoff = 0.0
+
+        result = client.generate("sys", "prompt")
+
+        assert result == "result text"
+        assert mock_client.post.call_count == 2
+        mock_sleep.assert_called_once_with(0.0)
+
+    @patch("web_scraper.agent.time.sleep")
+    @patch("web_scraper.agent.httpx.Client")
+    def test_generate_exhausts_retries_raises(
+        self, mock_client_cls: MagicMock, mock_sleep: MagicMock
+    ) -> None:
+        mock_client = MagicMock()
+        mock_client_cls.return_value = mock_client
+        mock_client.post.side_effect = httpx.ReadTimeout("timed out")
+
+        client = OllamaClient(host="http://localhost:11434", model="qwen2.5:3b")
+        client.max_retries = 2
+        client.retry_backoff = 0.0
+
+        with pytest.raises(httpx.ReadTimeout):
+            client.generate("sys", "prompt")
+
+        assert mock_client.post.call_count == 3
+        assert mock_sleep.call_count == 2
 
     @patch("web_scraper.agent.httpx.Client")
     def test_embed_multi_chunk_mean_pooled(self, mock_client_cls: MagicMock) -> None:
@@ -208,3 +288,70 @@ class TestContentAgent:
         decision, target_id, reason = agent._parse_decision("garbled response")
         assert decision == AgentDecision.SAVE
         assert target_id is None
+
+
+class TestDocumentMemory:
+    """Tests for DocumentMemory ChromaDB timeout and retry behavior."""
+
+    def _make_memory(self) -> "tuple[DocumentMemory, MagicMock]":
+        mem = DocumentMemory()
+        mem._retry_backoff = 0.0
+        mock_collection = MagicMock()
+
+        def _mock_connect() -> None:
+            mem._collection = mock_collection
+
+        mem._ensure_connected = _mock_connect  # type: ignore[method-assign]
+        mem._collection = mock_collection
+        return mem, mock_collection
+
+    def test_query_retries_on_transient_error(self) -> None:
+        mem, mock_col = self._make_memory()
+        valid_result = {
+            "ids": [["doc1"]],
+            "documents": [["body text"]],
+            "metadatas": [[{"url": "http://x.com", "title": "X"}]],
+            "distances": [[0.1]],
+        }
+        mock_col.count.return_value = 1
+        mock_col.query.side_effect = [
+            httpx.ConnectError("boom"),
+            valid_result,
+        ]
+
+        result = mem.query_similar([0.1, 0.2, 0.3])
+
+        assert len(result) == 1
+        assert result[0].doc_id == "doc1"
+        assert mock_col.query.call_count == 2
+
+    def test_query_raises_non_transient_immediately(self) -> None:
+        mem, mock_col = self._make_memory()
+        mock_col.count.return_value = 1
+        mock_col.query.side_effect = ValueError("bad")
+
+        with pytest.raises(ValueError, match="bad"):
+            mem.query_similar([0.1, 0.2, 0.3])
+
+        assert mock_col.query.call_count == 1
+
+    def test_query_timeout_raises_timeout_error(self) -> None:
+        import threading as _threading
+
+        mem, mock_col = self._make_memory()
+        mem._timeout = 0.2
+        mem._max_retries = 0
+
+        block = _threading.Event()
+
+        def _slow_count() -> int:
+            block.wait()
+            return 1
+
+        mock_col.count.side_effect = _slow_count
+
+        try:
+            with pytest.raises(TimeoutError):
+                mem.query_similar([0.1, 0.2, 0.3])
+        finally:
+            block.set()

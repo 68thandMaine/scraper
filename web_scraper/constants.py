@@ -12,3 +12,17 @@ DEFAULT_OLLAMA_NUM_PREDICT = 2048
 
 # Stays safely under nomic-embed-text's ~2048-token context window
 DEFAULT_MAX_EMBED_INPUT_CHARS = 6000
+
+# Retries after the first attempt (3 total attempts)
+DEFAULT_OLLAMA_MAX_RETRIES = 2
+# Base seconds for linear backoff between retries
+DEFAULT_OLLAMA_RETRY_BACKOFF = 2.0
+# Seconds to wait for a connection to be established
+DEFAULT_OLLAMA_CONNECT_TIMEOUT = 10.0
+
+# Hard cap per ChromaDB network call (seconds)
+DEFAULT_CHROMA_TIMEOUT = 30.0
+# Retries after the first attempt
+DEFAULT_CHROMA_MAX_RETRIES = 2
+# Base seconds for linear backoff between retries
+DEFAULT_CHROMA_RETRY_BACKOFF = 2.0
