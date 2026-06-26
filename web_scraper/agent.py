@@ -583,6 +583,7 @@ class ContentAgent:
         memory: Optional[DocumentMemory] = None,
         similarity_threshold: Optional[float] = None,
         top_k: int = 5,
+        skip_llm_clean: bool = False,
     ) -> None:
         self.output_dir = Path(output_dir)
         create_output_directory(self.output_dir)
@@ -592,6 +593,7 @@ class ContentAgent:
             os.getenv("SIMILARITY_THRESHOLD", "0.85")
         )
         self.top_k = top_k
+        self.skip_llm_clean = skip_llm_clean
         self.stats = AgentStats()
         self._file_index = self._next_file_index()
 
@@ -714,6 +716,11 @@ class ContentAgent:
             )
 
     def _clean_content(self, url: str, title: str, content: str) -> str:
+        if self.skip_llm_clean:
+            # Fast path: skip the LLM call and use the already-extracted text
+            # (extract_text_content in utils.py already strips scripts/styles/blanks)
+            logger.info("skip_llm_clean: using raw extracted text for %s", url)
+            return content
         content = _truncate_for_llm(content, "raw scrape body")
         prompt = CLEAN_USER_PROMPT.format(url=url, title=title, content=content)
         return self.ollama.generate(CLEAN_SYSTEM_PROMPT, prompt)

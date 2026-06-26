@@ -75,5 +75,8 @@ docker-up:
 docker-scrape:
 	docker compose --profile scrape run --rm scraper-agent scrape $(URL) $(ARGS)
 
+native-scrape:
+	./scripts/scrape-native.sh $(URL) $(ARGS)
+
 docs:
 	cd docs && npm install && npm run start

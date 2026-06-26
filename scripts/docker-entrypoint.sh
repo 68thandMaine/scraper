@@ -30,6 +30,17 @@ else
   echo "Skipping service wait (WAIT_FOR_SERVICES=false). Starting scraper immediately."
 fi
 
+# Inject corporate CA certs (e.g. Zscaler) if /certs contains any .pem or .crt files.
+_certs=$(find /certs -maxdepth 1 \( -name '*.pem' -o -name '*.crt' \) 2>/dev/null | head -1)
+if [ -n "${_certs}" ]; then
+  _certifi=$(python -c 'import certifi; print(certifi.where())')
+  cat "${_certifi}" /certs/*.pem /certs/*.crt > /tmp/ca-bundle.pem 2>/dev/null || true
+  export REQUESTS_CA_BUNDLE=/tmp/ca-bundle.pem
+  export SSL_CERT_FILE=/tmp/ca-bundle.pem
+  export CURL_CA_BUNDLE=/tmp/ca-bundle.pem
+  echo "Loaded custom CA certs from /certs into /tmp/ca-bundle.pem"
+fi
+
 mkdir -p "${SCRAPED_DATA_DIR:-/app/scraped_data}"
 
 exec python -m web_scraper "$@"

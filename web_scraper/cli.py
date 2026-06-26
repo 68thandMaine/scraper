@@ -111,6 +111,12 @@ def cli(verbose: bool) -> None:
     type=float,
     help="Cosine similarity threshold for consolidation (default: 0.85).",
 )
+@click.option(
+    "--no-llm-clean",
+    "skip_llm_clean",
+    is_flag=True,
+    help="Skip the LLM cleaning step (saves one generate call per page, ~33%% faster).",
+)
 def scrape(
     url: str,
     output_dir: str,
@@ -127,6 +133,7 @@ def scrape(
     model: Optional[str],
     embed_model: Optional[str],
     similarity_threshold: Optional[float],
+    skip_llm_clean: bool,
 ) -> None:
     """
     Scrape a website and extract text content.
@@ -172,6 +179,7 @@ def scrape(
                 ollama=ollama,
                 memory=None,
                 similarity_threshold=similarity_threshold,
+                skip_llm_clean=skip_llm_clean,
             )
         except ImportError as exc:
             click.echo(
