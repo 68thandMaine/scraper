@@ -64,7 +64,7 @@ class TestOllamaClient:
         mock_client_cls.return_value = mock_client
         mock_response = MagicMock()
         mock_response.json.return_value = {
-            "models": [{"name": "phi3:mini"}]
+            "data": [{"id": "phi3"}]
         }
         mock_response.raise_for_status.return_value = None
         mock_client.get.return_value = mock_response
@@ -82,7 +82,10 @@ class TestOllamaClient:
         mock_client = MagicMock()
         mock_client_cls.return_value = mock_client
         mock_response = MagicMock()
-        mock_response.json.return_value = {"response": "cleaned body"}
+        mock_response.is_success = True
+        mock_response.json.return_value = {
+            "choices": [{"message": {"content": "cleaned body"}}]
+        }
         mock_client.post.return_value = mock_response
 
         client = OllamaClient(host="http://localhost:11434", model="qwen2.5:3b")
@@ -97,7 +100,9 @@ class TestOllamaClient:
         mock_client_cls.return_value = mock_client
         mock_response = MagicMock()
         mock_response.is_success = True
-        mock_response.json.return_value = {"embeddings": [[0.1, 0.2, 0.3]]}
+        mock_response.json.return_value = {
+            "data": [{"embedding": [0.1, 0.2, 0.3]}]
+        }
         mock_client.post.return_value = mock_response
 
         client = OllamaClient(host="http://localhost:11434")
@@ -117,7 +122,9 @@ class TestOllamaClient:
         mock_client_cls.return_value = mock_client
         mock_response = MagicMock()
         mock_response.is_success = True
-        mock_response.json.return_value = {"response": "result text"}
+        mock_response.json.return_value = {
+            "choices": [{"message": {"content": "result text"}}]
+        }
         mock_client.post.side_effect = [
             httpx.ReadTimeout("timed out"),
             mock_response,
@@ -161,7 +168,10 @@ class TestOllamaClient:
         mock_response = MagicMock()
         mock_response.is_success = True
         mock_response.json.return_value = {
-            "embeddings": [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]
+            "data": [
+                {"embedding": [1.0, 0.0, 0.0]},
+                {"embedding": [0.0, 1.0, 0.0]},
+            ]
         }
         mock_client.post.return_value = mock_response
 

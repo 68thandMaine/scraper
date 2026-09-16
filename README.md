@@ -1,23 +1,33 @@
 # Web Scraper Agent
 
-A web scraper for macOS that crawls sites, cleans each page with a local
-**Ollama** model on **Apple Metal (GPU)**, and uses **ChromaDB** vector memory
-to detect duplicates and consolidate overlapping documentation.
+A web scraper for macOS that crawls sites, cleans each page with a local LLM
+served through **llama.cpp** (`llama-server`) on **Apple Metal (GPU)**, and
+uses **ChromaDB** vector memory to detect duplicates and consolidate
+overlapping documentation. `llama-server` exposes an OpenAI-compatible API
+(`/v1/chat/completions`, `/v1/embeddings`, `/v1/models`). Environment
+variables keep the `OLLAMA_*` names for backward compatibility, but they now
+point at `llama-server`, not Ollama.
 
 **Documentation:** run `make docs` or see the [docs site](docs/README.md).
 
 ## Recommended setup (Mac, bare-metal GPU)
 
-Run **Ollama natively** so inference uses Metal. Keep **ChromaDB in Docker**
-for persistence. Run the **Python scraper on the host** — no GPU work inside
+Run **two `llama-server` processes natively** — one for generation, one for
+embeddings — so inference uses Metal. Keep **ChromaDB in Docker** for
+persistence. Run the **Python scraper on the host** — no GPU work inside
 containers.
 
 ```
-┌─────────────────┐     ┌──────────────────┐     ┌─────────────────┐
-│  Ollama (host)  │◄────│  web_scraper     │────►│ ChromaDB (Docker)│
-│  Metal / GPU    │     │  python -m ...   │     │  localhost:8000  │
-│  localhost:11434│     └──────────────────┘     └─────────────────┘
-└─────────────────┘
+┌─────────────────────────┐     ┌──────────────────┐     ┌──────────────────┐
+│ llama-server (generate) │◄────│  web_scraper     │────►│ ChromaDB (Docker)│
+│ Metal / GPU              │     │  python -m ...   │     │  localhost:8000  │
+│ localhost:8081           │     └────────┬─────────┘     └──────────────────┘
+└─────────────────────────┘              │
+┌─────────────────────────┐              │
+│ llama-server (embed)    │◄─────────────┘
+│ Metal / GPU              │
+│ localhost:8080           │
+└─────────────────────────┘
 ```
 
 ### Prerequisites
@@ -26,16 +36,18 @@ containers.
 - [Homebrew](https://brew.sh)
 - [Docker Desktop](https://www.docker.com/products/docker-desktop/) (ChromaDB only)
 - Python 3.11+ and a project virtualenv
+- `llama.cpp` built with Metal support, providing the `llama-server` binary
 
-16 GB RAM is recommended for `qwen2.5:3b` plus ChromaDB. The default model is
-`qwen2.5:1.5b`, which is faster on GPU with little quality loss for this
-pipeline.
+16 GB RAM is recommended for a small (1.5B-3B) GGUF generation model plus
+ChromaDB. The defaults in [.env.example](.env.example) are `qwen`
+(generation) and `nomic-embed-text` (embeddings) — these are the `--alias`
+names each `llama-server` process must report.
 
 ### One-time install
 
 ```bash
-# Ollama (Metal GPU)
-brew install ollama
+# llama.cpp (Metal GPU) — provides the llama-server binary
+brew install llama.cpp
 
 # Python deps
 python3 -m venv .venv
@@ -47,53 +59,45 @@ pip install -e .
 cp .env.example .env
 ```
 
-Pull models once (the helper script below also pulls if missing):
+Download (or convert) GGUF files for your generation and embedding models,
+then start one `llama-server` per role. The `--alias` passed to each server
+is the model ID the scraper looks up over `/v1/models`, so it must match
+`OLLAMA_MODEL` / `OLLAMA_EMBED_MODEL`:
 
 ```bash
-ollama pull qwen2.5:1.5b
-ollama pull nomic-embed-text
+# Generation server on port 8081 (matches OLLAMA_HOST in .env.example)
+llama-server -m /path/to/qwen.gguf --alias qwen --port 8081 --n-gpu-layers 999
+
+# Embedding server on port 8080 (matches OLLAMA_EMBED_HOST in .env.example)
+llama-server -m /path/to/nomic-embed-text.gguf --alias nomic-embed-text \
+  --port 8080 --embedding --n-gpu-layers 999
 ```
 
 ### Quick start
 
-From the repo root with `.venv` created and Docker Desktop running:
+With both `llama-server` processes running and Docker Desktop up:
 
 ```bash
-make native-scrape URL="https://example.com/docs" ARGS="-y --max-files 50"
+docker compose up -d chromadb
+
+source .venv/bin/activate
+python -m web_scraper scrape https://example.com/docs -y --max-files 50
 ```
-
-Or use the script directly:
-
-```bash
-./scripts/scrape-native.sh https://example.com/docs \
-  -y \
-  --output-dir ./scraped_data \
-  --max-files 50
-```
-
-`scrape-native.sh` will:
-
-1. Use native Ollama when `ollama` is on your PATH (Metal GPU)
-2. Stop the Docker `scraper-ollama` container if it is holding port 11434
-3. Start `ollama serve` if nothing is listening on 11434
-4. Pull missing models
-5. Start ChromaDB via Docker if it is not already up
-6. Run the scraper with `.venv/bin/python`
 
 Output is written to `./scraped_data/` by default (override with `--output-dir`).
 
 ### Verify services
 
 ```bash
-curl http://localhost:11434/api/tags    # native Ollama
+curl http://localhost:8081/v1/models         # generation llama-server
+curl http://localhost:8080/v1/models         # embedding llama-server
 curl http://localhost:8000/api/v2/heartbeat  # ChromaDB in Docker
-ollama ps                                 # confirm a model is loaded on GPU
 ```
 
 ### Example scrape
 
 ```bash
-./scripts/scrape-native.sh \
+python -m web_scraper scrape \
   "https://code.claude.com/docs/en/memory" \
   -y \
   --subdomain code.claude.com/docs/en \
@@ -104,7 +108,7 @@ ollama ps                                 # confirm a model is loaded on GPU
 ### Common flags
 
 ```bash
-# Agent mode (default) — Ollama + ChromaDB required
+# Agent mode (default) — llama-server + ChromaDB required
 python -m web_scraper scrape https://example.com -y
 
 # Skip LLM cleaning (~33% faster; still embeds and dedupes)
@@ -119,21 +123,38 @@ python -m web_scraper scrape https://example.com --no-agent -y
 # Tune models and dedup threshold
 python -m web_scraper scrape https://example.com \
   -y \
-  --model qwen2.5:3b \
+  --model qwen \
   --embed-model nomic-embed-text \
   --similarity-threshold 0.85
 ```
 
-When running `python -m web_scraper` directly, Ollama defaults to
-`http://localhost:11434` and ChromaDB to `localhost:8000`. The Python CLI does
-not auto-load a `.env` file; export variables or pass CLI flags instead.
+The Python CLI does not auto-load a `.env` file. Without exported
+environment variables it uses generation on `http://localhost:8081` and
+embeddings on `http://localhost:8080`; export the variables from
+`.env.example` (or run through `make`/Docker Compose, which load `.env`) to
+target the two-port `llama-server` setup described above.
+
+### Generation timeouts
+
+The scraper requests streamed tokens and disables thinking for its cleaning
+and deduplication calls using `chat_template_kwargs.enable_thinking=false`.
+`OLLAMA_TIMEOUT` is the read inactivity timeout: a long generation can finish
+as long as tokens keep arriving. Prompt processing and queue waits must still
+fit within that timeout. The default is 600 seconds.
+
+Set `OLLAMA_MODEL` to the alias reported by `/v1/models` (for example, `hermes`
+on an existing local server). Empty, interrupted, and token-limit-truncated
+responses are treated as errors; the original page is preserved for retry.
+If the output limit is reached, increase `OLLAMA_NUM_PREDICT` (for example,
+4096 for longer pages). This does not change the input truncation limit or
+guarantee full-site coverage.
 
 ## Features
 
 - Crawl websites and follow internal links (subdomain + path filters)
 - Agent pipeline: clean, embed, recall, decide, store
 - ChromaDB vector memory for similarity and consolidation
-- Native Mac GPU inference via Ollama (Metal)
+- Native Mac GPU inference via llama.cpp (`llama-server`, Metal)
 - Legacy `--no-agent` mode for direct HTML-to-text output
 - CLI, tests, and Docusaurus documentation
 
@@ -142,20 +163,19 @@ not auto-load a `.env` file; export variables or pass CLI flags instead.
 | Command | Description |
 |---------|-------------|
 | `make install` | Install Python dependencies |
-| `make native-scrape URL=... ARGS="..."` | Scrape with native Ollama (Metal) + Docker ChromaDB |
-| `make docker-up` | Start ChromaDB only (or Ollama + ChromaDB if you use all-Docker mode) |
+| `make native-scrape URL=... ARGS="..."` | Legacy Ollama-based native script (see `scripts/scrape-native.sh`); for the `llama-server` setup, use the manual Quick start steps above |
+| `make docker-up` | Start ChromaDB via Docker (also starts the legacy `ollama` container defined in `docker-compose.yml`) |
 | `make docker-scrape URL=...` | Run scraper inside Docker (see below) |
 | `make test` | Run pytest with coverage |
 | `make docs` | Start Docusaurus locally |
 
-## Alternative: all-Docker (CPU Ollama on Mac)
+## Alternative: scraper in Docker, llama-server on host
 
-If you do not install Ollama via Homebrew, everything can run in Docker.
-Ollama inside Docker on macOS does **not** use Metal; prefer the native setup
-above for speed.
+If you prefer to run the scraper itself in Docker while still using
+`llama-server` on the host for Metal GPU inference:
 
 ```bash
-docker compose up -d ollama chromadb
+docker compose up -d chromadb
 
 docker compose --profile scrape run --rm scraper-agent scrape \
   https://example.com/docs \
@@ -163,34 +183,23 @@ docker compose --profile scrape run --rm scraper-agent scrape \
   --max-files 50
 ```
 
-**Hybrid:** scraper in Docker, Ollama on the host (GPU):
-
-```bash
-ollama pull qwen2.5:1.5b
-ollama pull nomic-embed-text
-docker compose up -d chromadb
-
-OLLAMA_HOST=http://host.docker.internal:11434 \
-docker compose --profile scrape run --rm scraper-agent scrape \
-  "https://example.com/docs" \
-  --output-dir /app/scraped_data \
-  -y
-```
-
-For Docker Compose, copy `.env.example` to `.env` to override
-`OLLAMA_HOST`, models, and thresholds without inline env vars.
+The `scraper-agent` service in `docker-compose.yml` defaults `OLLAMA_HOST`
+and `OLLAMA_EMBED_HOST` to `http://host.docker.internal:8081` and
+`http://host.docker.internal:8080`, so it reaches `llama-server` processes
+running on the Mac host without extra configuration. Copy `.env.example` to
+`.env` to override hosts, models, or thresholds without inline env vars.
 
 ## Project structure
 
 ```
 scraper-main/
 ├── web_scraper/
-│   ├── agent.py          # Ollama + ChromaDB agent pipeline
+│   ├── agent.py          # llama-server + ChromaDB agent pipeline
 │   ├── prompts.py        # LLM prompt templates
 │   ├── scraper.py        # Crawler
 │   └── cli.py            # CLI
 ├── scripts/
-│   └── scrape-native.sh  # Mac GPU quick path
+│   └── scrape-native.sh  # Legacy Ollama-based Mac GPU quick path
 ├── docker-compose.yml
 ├── Dockerfile
 ├── docs/                 # Docusaurus documentation site
@@ -209,8 +218,18 @@ make format
 
 ## Environment
 
-See [.env.example](.env.example) for optional overrides: `OLLAMA_MODEL`,
-`OLLAMA_EMBED_MODEL`, `MAX_LLM_INPUT_CHARS`, `CHROMA_HOST`, and
-`SIMILARITY_THRESHOLD`. A `.env` file is optional; Docker Compose reads it
-for `${VAR}` substitution. Native `python -m web_scraper` uses built-in
-defaults unless you `export` variables or pass CLI flags.
+See [.env.example](.env.example) for optional overrides. Variable names keep
+the `OLLAMA_*` prefix for backward compatibility even though they now
+configure `llama-server`:
+
+- `OLLAMA_HOST` — generation `llama-server` base URL (default `http://localhost:8081` in `.env.example`)
+- `OLLAMA_MODEL` — generation model alias (default `qwen`)
+- `OLLAMA_EMBED_HOST` — embedding `llama-server` base URL (default `http://localhost:8080` in `.env.example`); leave blank to share `OLLAMA_HOST`
+- `OLLAMA_EMBED_MODEL` — embedding model alias (default `nomic-embed-text`)
+- `MAX_LLM_INPUT_CHARS`, `MAX_EMBED_INPUT_CHARS` — input truncation limits
+- `CHROMA_HOST`, `CHROMA_PORT` — ChromaDB connection (Docker default `localhost:8000`)
+- `SIMILARITY_THRESHOLD` — dedup/consolidation threshold
+
+A `.env` file is optional; Docker Compose reads it for `${VAR}` substitution.
+Native `python -m web_scraper` uses built-in defaults unless you `export`
+variables or pass CLI flags.

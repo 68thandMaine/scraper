@@ -323,6 +323,8 @@ class WebScraper:
                             skipped += 1
                         else:
                             errors += 1
+                            if result.file_path is not None:
+                                files_created += 1
                         with spinner.lock:
                             pbar.set_postfix(
                                 saved=saved,

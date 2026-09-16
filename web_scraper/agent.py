@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import math
 import os
@@ -32,7 +33,9 @@ from .constants import (
     DEFAULT_MAX_EMBED_INPUT_CHARS,
     DEFAULT_MAX_LLM_INPUT_CHARS,
     DEFAULT_OLLAMA_CONNECT_TIMEOUT,
+    DEFAULT_OLLAMA_EMBED_HOST,
     DEFAULT_OLLAMA_EMBED_MODEL,
+    DEFAULT_OLLAMA_HOST,
     DEFAULT_OLLAMA_MAX_RETRIES,
     DEFAULT_OLLAMA_MODEL,
     DEFAULT_OLLAMA_NUM_PREDICT,
@@ -67,6 +70,7 @@ class AgentDecision(str, Enum):
     SAVE = "SAVE"
     CONSOLIDATE = "CONSOLIDATE"
     SKIP = "SKIP"
+    ERROR = "ERROR"
 
 
 @dataclass
@@ -101,20 +105,33 @@ class SimilarDocument:
 
 
 class OllamaClient:
-    """Thin HTTP client for Ollama generate and embed APIs."""
+    """HTTP client for OpenAI-compatible llama-server generate and embed APIs.
+
+    Supports separate hosts for generation and embedding so that two
+    llama-server processes (e.g. on different ports) can serve each role.
+    Set ``OLLAMA_EMBED_HOST`` to override the embedding endpoint; it defaults
+    to the same value as ``OLLAMA_HOST``.
+    """
 
     def __init__(
         self,
         host: Optional[str] = None,
         model: Optional[str] = None,
         embed_model: Optional[str] = None,
+        embed_host: Optional[str] = None,
         timeout: Optional[float] = None,
     ) -> None:
-        self.host = (host or os.getenv("OLLAMA_HOST", "http://localhost:11434")).rstrip("/")
+        self.host = (host or os.getenv("OLLAMA_HOST", DEFAULT_OLLAMA_HOST)).rstrip("/")
         self.model = model or os.getenv("OLLAMA_MODEL", DEFAULT_OLLAMA_MODEL)
         self.embed_model = embed_model or os.getenv(
             "OLLAMA_EMBED_MODEL", DEFAULT_OLLAMA_EMBED_MODEL
         )
+        # Separate host for the embedding server (defaults to the generation host)
+        raw_embed_host = embed_host or os.getenv(
+            "OLLAMA_EMBED_HOST", DEFAULT_OLLAMA_EMBED_HOST
+        )
+        self.embed_host = raw_embed_host.rstrip("/") if raw_embed_host else self.host
+
         if timeout is None:
             timeout = float(os.getenv("OLLAMA_TIMEOUT", str(DEFAULT_OLLAMA_TIMEOUT)))
         self.timeout = timeout
@@ -127,22 +144,40 @@ class OllamaClient:
         self.retry_backoff = float(
             os.getenv("OLLAMA_RETRY_BACKOFF", str(DEFAULT_OLLAMA_RETRY_BACKOFF))
         )
-        self._client = httpx.Client(
-            base_url=self.host,
-            timeout=httpx.Timeout(
-                connect=DEFAULT_OLLAMA_CONNECT_TIMEOUT,
-                read=self.timeout,
-                write=30.0,
-                pool=DEFAULT_OLLAMA_CONNECT_TIMEOUT,
-            ),
-            limits=httpx.Limits(max_keepalive_connections=0, max_connections=10),
+        _timeout = httpx.Timeout(
+            connect=DEFAULT_OLLAMA_CONNECT_TIMEOUT,
+            read=self.timeout,
+            write=30.0,
+            pool=DEFAULT_OLLAMA_CONNECT_TIMEOUT,
         )
+        _limits = httpx.Limits(max_keepalive_connections=0, max_connections=10)
+        self._gen_client = httpx.Client(
+            base_url=self.host,
+            timeout=_timeout,
+            limits=_limits,
+        )
+        if self.embed_host == self.host:
+            self._embed_client = self._gen_client
+        else:
+            self._embed_client = httpx.Client(
+                base_url=self.embed_host,
+                timeout=_timeout,
+                limits=_limits,
+            )
+        # Alias kept for code that still references self._client directly
+        self._client = self._gen_client
 
     def list_models(self) -> List[str]:
-        """Return model names reported by Ollama."""
-        response = self._client.get("/api/tags")
+        """Return model IDs reported by the generation host."""
+        response = self._gen_client.get("/v1/models")
         response.raise_for_status()
-        return [entry["name"] for entry in response.json().get("models", [])]
+        return [entry["id"] for entry in response.json().get("data", [])]
+
+    def _list_embed_models(self) -> List[str]:
+        """Return model IDs reported by the embedding host."""
+        response = self._embed_client.get("/v1/models")
+        response.raise_for_status()
+        return [entry["id"] for entry in response.json().get("data", [])]
 
     @staticmethod
     def _model_matches(requested: str, available: List[str]) -> bool:
@@ -156,52 +191,71 @@ class OllamaClient:
         """
         Verify generation and embedding models exist before scraping.
 
+        Each model is checked against its own host (generation vs embedding),
+        so two separate llama-server processes on different ports are supported.
+
         Raises:
-            ConnectionError: Ollama is not reachable.
-            ValueError: One or more models are not pulled.
+            ConnectionError: A llama-server host is not reachable.
+            ValueError: One or more models are not available.
         """
         try:
-            available = self.list_models()
+            gen_available = self.list_models()
         except httpx.HTTPError as exc:
             raise ConnectionError(
-                f"Cannot reach Ollama at {self.host}. "
-                "Start Ollama or set OLLAMA_HOST correctly."
+                f"Cannot reach llama-server (generation) at {self.host}. "
+                "Ensure the server is running and OLLAMA_HOST is correct."
             ) from exc
 
         logger.info(
-            "Ollama at %s has %d model(s): %s",
+            "llama-server (gen) at %s has %d model(s): %s",
             self.host,
-            len(available),
-            ", ".join(available) if available else "(none)",
+            len(gen_available),
+            ", ".join(gen_available) if gen_available else "(none)",
         )
 
+        if self.embed_host != self.host:
+            try:
+                embed_available = self._list_embed_models()
+            except httpx.HTTPError as exc:
+                raise ConnectionError(
+                    f"Cannot reach llama-server (embed) at {self.embed_host}. "
+                    "Ensure the server is running and OLLAMA_EMBED_HOST is correct."
+                ) from exc
+            logger.info(
+                "llama-server (embed) at %s has %d model(s): %s",
+                self.embed_host,
+                len(embed_available),
+                ", ".join(embed_available) if embed_available else "(none)",
+            )
+        else:
+            embed_available = gen_available
+
         missing: List[str] = []
-        if not self._model_matches(self.model, available):
-            missing.append(self.model)
-        if not self._model_matches(self.embed_model, available):
-            missing.append(self.embed_model)
+        if not self._model_matches(self.model, gen_available):
+            missing.append(f"{self.model} (generation, host: {self.host})")
+        if not self._model_matches(self.embed_model, embed_available):
+            missing.append(f"{self.embed_model} (embedding, host: {self.embed_host})")
 
         if missing:
-            pull_lines = "\n".join(f"  ollama pull {name}" for name in missing)
             raise ValueError(
-                f"Ollama at {self.host} is missing model(s): {', '.join(missing)}\n"
-                f"Pull them on the host serving {self.host}:\n{pull_lines}"
+                f"llama-server is missing model(s): {', '.join(missing)}\n"
+                "Check that the correct --model and --alias flags are set on each server."
             )
 
     def _post_with_retry(
-        self, path: str, payload: dict, operation: str
+        self, client: "httpx.Client", path: str, payload: dict, operation: str
     ) -> httpx.Response:
         last_exc: Exception = RuntimeError("unreachable")
         total = self.max_retries + 1
         for attempt in range(1, total + 1):
             try:
-                return self._client.post(path, json=payload)
+                return client.post(path, json=payload)
             except (httpx.TimeoutException, httpx.TransportError) as exc:
                 last_exc = exc
                 if attempt < total:
                     delay = self.retry_backoff * attempt
                     logger.warning(
-                        "Ollama %s POST failed (attempt %d/%d): %r; retrying in %.1fs",
+                        "llama-server %s POST failed (attempt %d/%d): %r; retrying in %.1fs",
                         operation,
                         attempt,
                         total,
@@ -211,7 +265,7 @@ class OllamaClient:
                     time.sleep(delay)
         raise last_exc
 
-    def _raise_for_status(self, response: httpx.Response, operation: str) -> None:
+    def _raise_for_status(self, response: httpx.Response, operation: str, model: str = "", host: str = "") -> None:
         if response.is_success:
             return
         detail = response.text
@@ -219,18 +273,27 @@ class OllamaClient:
             detail = response.json().get("error", detail)
         except Exception:
             pass
+        model = model or self.model
+        host = host or self.host
         if response.status_code == 404:
             raise ValueError(
-                f"Ollama {operation} failed: model '{self.model}' not found at "
-                f"{self.host}. Run: ollama pull {self.model}\n"
+                f"llama-server {operation} failed: model '{model}' not found at "
+                f"{host}. Verify the server is running with the correct --model and --alias.\n"
                 f"Detail: {detail}"
             ) from None
-        response.raise_for_status()
+        try:
+            response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            raise httpx.HTTPStatusError(
+                f"{exc}; server detail: {detail}",
+                request=exc.request,
+                response=exc.response,
+            ) from exc
 
     def generate(self, system: str, prompt: str) -> str:
         """Run a chat-style generation and return assistant text."""
         logger.info(
-            "Ollama generate: model=%s prompt_chars=%d host=%s",
+            "llama-server generate: model=%s prompt_chars=%d host=%s",
             self.model,
             len(prompt),
             self.host,
@@ -238,24 +301,72 @@ class OllamaClient:
         started = time.perf_counter()
         num_predict = int(os.getenv("OLLAMA_NUM_PREDICT", str(DEFAULT_OLLAMA_NUM_PREDICT)))
         response = self._post_with_retry(
-            "/api/generate",
+            self._gen_client,
+            "/v1/chat/completions",
             {
                 "model": self.model,
-                "system": system,
-                "prompt": prompt,
-                "stream": False,
-                "options": {"num_predict": num_predict},
+                "messages": [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": prompt},
+                ],
+                # httpx consumes chunks as they arrive, so the read timeout
+                # measures network inactivity rather than total generation time.
+                "stream": True,
+                "max_tokens": num_predict,
+                # Return final text without spending the budget on reasoning.
+                "chat_template_kwargs": {"enable_thinking": False},
             },
             "generate",
         )
         self._raise_for_status(response, "generate")
-        data = response.json()
+        if "text/event-stream" in response.headers.get("content-type", ""):
+            data = self._decode_generation_stream(response)
+        else:
+            data = response.json()
+        choices = data.get("choices") or []
+        if choices and choices[0].get("finish_reason") == "length":
+            raise ValueError(
+                "Generation exhausted its output token budget; "
+                "increase OLLAMA_NUM_PREDICT"
+            )
+        content = (choices[0].get("message", {}).get("content") or "").strip() if choices else ""
+        if not content:
+            raise ValueError("Generation returned no assistant text")
         logger.info(
-            "Ollama generate finished in %.1fs (response_chars=%d)",
+            "llama-server generate finished in %.1fs (response_chars=%d)",
             time.perf_counter() - started,
-            len(data.get("response") or ""),
+            len(content),
         )
-        return (data.get("response") or "").strip()
+        return content
+
+    @staticmethod
+    def _decode_generation_stream(response: httpx.Response) -> Dict[str, Any]:
+        """Assemble llama.cpp SSE deltas, rejecting interrupted responses."""
+        parts = []
+        finish_reason = None
+        done = False
+        for line in response.iter_lines():
+            if not line.startswith("data:"):
+                continue
+            payload = line[5:].strip()
+            if payload == "[DONE]":
+                done = True
+                break
+            event = json.loads(payload)
+            if event.get("error"):
+                raise ValueError(f"Generation stream failed: {event['error']}")
+            for choice in event.get("choices", []):
+                if choice.get("index", 0) != 0:
+                    continue
+                parts.append(choice.get("delta", {}).get("content") or "")
+                if choice.get("finish_reason"):
+                    finish_reason = choice["finish_reason"]
+        if not done or not finish_reason:
+            raise ValueError("Generation stream ended before completion")
+        return {"choices": [{
+            "message": {"content": "".join(parts)},
+            "finish_reason": finish_reason,
+        }]}
 
     def _chunk_for_embed(self, text: str) -> List[str]:
         """Split text into chunks no longer than max_embed_input_chars."""
@@ -302,10 +413,10 @@ class OllamaClient:
     def embed(self, text: str) -> List[float]:
         """Generate an embedding vector for the given text."""
         logger.info(
-            "Ollama embed: model=%s input_chars=%d host=%s",
+            "llama-server embed: model=%s input_chars=%d host=%s",
             self.embed_model,
             len(text),
-            self.host,
+            self.embed_host,
         )
         started = time.perf_counter()
         chunks = self._chunk_for_embed(text)
@@ -319,49 +430,52 @@ class OllamaClient:
             input_payload = chunks[0]
 
         response = self._post_with_retry(
-            "/api/embed",
+            self._embed_client,
+            "/v1/embeddings",
             {
                 "model": self.embed_model,
                 "input": input_payload,
             },
             "embed",
         )
-        if not response.is_success:
-            detail = response.text
-            try:
-                detail = response.json().get("error", detail)
-            except Exception:
-                pass
-            if response.status_code == 404:
-                raise ValueError(
-                    f"Ollama embed failed: model '{self.embed_model}' not found at "
-                    f"{self.host}. Run: ollama pull {self.embed_model}\n"
-                    f"Detail: {detail}"
-                ) from None
-            response.raise_for_status()
+        # llama.cpp can reject an input smaller than its context window when
+        # it exceeds the physical batch size. Split only size failures; never
+        # discard text or endlessly retry unrelated server errors.
+        if not response.is_success and any(
+            marker in response.text.lower()
+            for marker in ("too large to process", "exceeds the available context", "exceeds the context")
+        ):
+            vectors = []
+            for chunk in chunks:
+                if len(chunk) <= 1:
+                    self._raise_for_status(response, "embed", self.embed_model, self.embed_host)
+                midpoint = len(chunk) // 2
+                logger.warning("Embedding input rejected for size; splitting %d chars", len(chunk))
+                vectors.extend((self.embed(chunk[:midpoint]), self.embed(chunk[midpoint:])))
+            return self._mean_pool_and_normalize(vectors)
+        self._raise_for_status(response, "embed", model=self.embed_model, host=self.embed_host)
         data = response.json()
-        logger.info("Ollama embed finished in %.1fs", time.perf_counter() - started)
+        logger.info("llama-server embed finished in %.1fs", time.perf_counter() - started)
 
+        items: List[Any] = data.get("data") or []
         if len(chunks) == 1:
-            embeddings = data.get("embeddings") or []
-            if embeddings:
-                return list(embeddings[0])
-            embedding = data.get("embedding")
-            if embedding:
-                return list(embedding)
-            raise ValueError("Ollama embed response contained no embedding vector")
+            if not items:
+                raise ValueError("llama-server embed response contained no embedding vector")
+            return list(items[0]["embedding"])
 
-        embeddings = data.get("embeddings") or []
-        if not embeddings:
-            raise ValueError("Ollama embed batch response contained no embeddings")
-        dim = len(embeddings[0])
-        if any(len(v) != dim for v in embeddings):
-            raise ValueError("Ollama embed batch returned vectors of inconsistent dimension")
-        return self._mean_pool_and_normalize([list(v) for v in embeddings])
+        if not items:
+            raise ValueError("llama-server embed batch response contained no embeddings")
+        vectors = [item["embedding"] for item in items]
+        dim = len(vectors[0])
+        if any(len(v) != dim for v in vectors):
+            raise ValueError("llama-server embed batch returned vectors of inconsistent dimension")
+        return self._mean_pool_and_normalize([list(v) for v in vectors])
 
     def close(self) -> None:
-        """Close the HTTP client."""
-        self._client.close()
+        """Close the HTTP client(s)."""
+        self._gen_client.close()
+        if self._embed_client is not self._gen_client:
+            self._embed_client.close()
 
     def __enter__(self) -> "OllamaClient":
         return self
@@ -710,8 +824,18 @@ class ContentAgent:
         except Exception as exc:
             self.stats.errors += 1
             logger.exception("Agent failed for %s: %s", url, exc)
+            # Preserve the source for retry without depending on the failed
+            # model or vector store. ERROR stays distinct from an AI skip.
+            doc_id = self._make_doc_id(title)
+            try:
+                file_path = self._write_file(doc_id, url, title, raw_content)
+            except OSError:
+                logger.exception("Could not preserve failed page: %s", url)
+                file_path = None
             return ProcessResult(
-                decision=AgentDecision.SKIP,
+                decision=AgentDecision.ERROR,
+                doc_id=doc_id,
+                file_path=file_path,
                 reason=f"Agent error: {exc}",
             )
 
