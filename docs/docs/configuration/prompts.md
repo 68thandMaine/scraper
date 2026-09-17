@@ -41,7 +41,7 @@ If parsing fails, the agent defaults to **SAVE**.
 
 ## Tips
 
-- Keep system prompts short and imperative for small models like `qwen2.5:3b`.
+- Keep system prompts short and imperative for small local generation models.
 - Large pages are truncated to `MAX_LLM_INPUT_CHARS` (default 10000) before CLEAN.
 - Lower `SIMILARITY_THRESHOLD` to surface more consolidation candidates.
-- Test prompt changes with `pytest tests/test_agent.py` (mocked Ollama).
+- Test prompt changes with `pytest tests/test_agent.py` (mocked model client).

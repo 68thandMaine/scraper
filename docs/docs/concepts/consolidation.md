@@ -13,8 +13,8 @@ The agent avoids duplicate and overlapping documentation in `scraped_data/`.
 1. ChromaDB returns nearest neighbors by embedding distance.
 2. Neighbors with similarity `>= SIMILARITY_THRESHOLD` are listed in the
    **DECIDE** prompt.
-3. Ollama chooses **CONSOLIDATE** with a `TARGET_ID` or **SAVE** if topics
-   differ despite surface similarity.
+3. The generation server chooses **CONSOLIDATE** with a `TARGET_ID` or **SAVE**
+   if topics differ despite surface similarity.
 
 ## Consolidate action
 

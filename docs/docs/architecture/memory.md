@@ -19,7 +19,7 @@ description: ChromaDB vector store and embedding strategy.
 |-------|-------------|
 | `id` | Filename stem, e.g. `003_API_Reference` |
 | `document` | Cleaned body text |
-| `embedding` | Vector from Ollama embed model |
+| `embedding` | Vector from the configured embedding model server |
 | `metadata` | `url`, `title`, `doc_id`, `timestamp`, `word_count` |
 
 ## Similarity
@@ -30,6 +30,12 @@ to similarity as `1.0 - distance` and compares against
 
 Documents above the threshold are included in the **DECIDE** prompt so the LLM
 can choose consolidation vs. treating content as distinct.
+
+The client calls the embedding server's OpenAI-compatible `/v1/embeddings`
+endpoint. Inputs larger than `MAX_EMBED_INPUT_CHARS` (default `6000`) are
+chunked and mean-pooled. If the server rejects a chunk because of its physical
+context or batch limit, the client splits that chunk again and preserves the
+full input; unrelated server errors remain errors.
 
 ## Persistence
 

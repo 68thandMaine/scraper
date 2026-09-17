@@ -31,7 +31,7 @@ python -m web_scraper scrape URL [OPTIONS]
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--agent / --no-agent` | `--agent` | Enable Ollama agent pipeline |
+| `--agent / --no-agent` | `--agent` | Enable the local model-server agent pipeline |
 | `--model` | `OLLAMA_MODEL` | Generation model |
 | `--embed-model` | `OLLAMA_EMBED_MODEL` | Embedding model |
 | `--similarity-threshold` | `0.85` | Cosine similarity for recall |
@@ -48,7 +48,7 @@ python -m web_scraper scrape https://example.com --no-agent
 
 # Local with agent
 python -m web_scraper scrape https://example.com \
-  --model qwen2.5:3b --similarity-threshold 0.9
+  --model qwen --embed-model nomic-embed-text --similarity-threshold 0.9
 ```
 
 ## Other commands

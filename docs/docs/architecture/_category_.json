@@ -4,6 +4,6 @@
   "link": {
     "type": "generated-index",
     "title": "Architecture",
-    "description": "How the scraper, Ollama agent, and ChromaDB memory work together."
+    "description": "How the scraper, local model servers, and ChromaDB memory work together."
   }
 }

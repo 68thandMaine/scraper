@@ -9,12 +9,13 @@ description: System architecture and data flow.
 ```mermaid
 flowchart LR
     subgraph compose [Docker Compose]
-        Ollama[ollama]
         Chroma[chromadb]
         Agent[scraper-agent]
     end
-    Agent -->|POST /api/generate| Ollama
-    Agent -->|POST /api/embed| Ollama
+    Gen[llama-server generation]
+    Embed[llama-server embedding]
+    Agent -->|POST /v1/chat/completions| Gen
+    Agent -->|POST /v1/embeddings| Embed
     Agent -->|query / upsert| Chroma
     Agent -->|write .txt| Volume[scraped_data]
 ```
@@ -23,15 +24,27 @@ flowchart LR
 
 ### scraper-agent
 
-Built from the project `Dockerfile`. Runs `python -m web_scraper` with an
-entrypoint that waits for Ollama and ChromaDB health before executing commands.
+Built from the project `Dockerfile`. Runs `python -m web_scraper` and connects
+to ChromaDB plus the configured generation and embedding model servers.
+
+### llama-server processes
+
+The client uses the OpenAI-compatible `llama-server` API. `OLLAMA_HOST` names
+the generation server for cleaning and decisions; `OLLAMA_EMBED_HOST` names the
+embedding server. The two variables may point to separate processes, commonly
+ports `8081` and `8080`. Before crawling, the CLI checks `/v1/models` on each
+host and verifies the configured model aliases.
 
 ### ollama
 
-Hosts two models by default:
+The Compose file retains a bundled `ollama` service at port `11434` as a
+compatibility path. Its entrypoint pulls the legacy default generation and
+embedding models. To use it with the current agent, override both host
+variables and use model aliases that the service reports; otherwise use the
+two `llama-server` processes described above.
 
-- **qwen2.5:3b** -- generation (clean, decide, consolidate)
-- **nomic-embed-text** -- embeddings for vector similarity (separate model)
+The Python environment variable names keep the `OLLAMA_*` prefix for backward
+compatibility; they do not change the `/v1` API used by the current client.
 
 ### chromadb
 

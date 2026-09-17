@@ -6,8 +6,9 @@ sidebar_label: Introduction
 # Web Scraper Agent
 
 **Web Scraper Agent** is a Dockerized web scraper that crawls documentation
-sites, cleans each page with a local **Ollama** model, and uses **ChromaDB**
-vector memory to detect duplicates and consolidate overlapping content.
+sites, cleans each page with a local generation model served by
+**llama-server**, and uses **ChromaDB** vector memory to detect duplicates and
+consolidate overlapping content.
 
 ## What it does
 
@@ -23,9 +24,15 @@ vector memory to detect duplicates and consolidate overlapping content.
 
 | Service | Role |
 |---------|------|
-| `scraper-agent` | Python crawler + Ollama agent pipeline |
-| `ollama` | Local LLM for cleaning and decisions (`qwen2.5:3b`) |
+| `scraper-agent` | Python crawler + local model-server agent pipeline |
+| `llama-server` (generation) | Local model for cleaning and decisions |
+| `llama-server` (embedding) | Local model for vector embeddings |
 | `chromadb` | Vector memory for similarity search |
+
+The Compose file also retains a bundled `ollama` service as a compatibility
+path. The current default configuration uses separate generation and embedding
+`llama-server` endpoints; see [Getting Started](./getting-started) for the
+required health checks.
 
 ## Documentation
 

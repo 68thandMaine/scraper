@@ -1,7 +1,7 @@
 ---
 sidebar_position: 2
 sidebar_label: Backward Compatibility
-description: Legacy scraping without the Ollama agent.
+description: Legacy scraping without the local model-server agent.
 ---
 
 # Backward Compatibility
@@ -16,7 +16,7 @@ python -m web_scraper scrape https://example.com --no-agent
 
 In legacy mode:
 
-- No Ollama or ChromaDB connection is required.
+- No model-server or ChromaDB connection is required.
 - Pages are saved directly after HTML text extraction.
 - No cleaning, embedding, or consolidation runs.
 
@@ -36,5 +36,5 @@ you pass `--no-agent` to the scrape command.
 
 ## Tests
 
-Existing scraper tests run without an agent. Agent tests mock Ollama and
-ChromaDB in `tests/test_agent.py`.
+Existing scraper tests run without an agent. Agent tests mock the model client
+and ChromaDB in `tests/test_agent.py`.
